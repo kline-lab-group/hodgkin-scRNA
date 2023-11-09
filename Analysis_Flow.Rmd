@@ -1,0 +1,373 @@
+---
+title: "Hodgkin Flow Analysis"
+output: html_notebook
+---
+
+```{r}
+devtools::document()
+
+library(scales)
+library(patchwork)
+library(ggrastr)
+library(tidyverse)
+library(afterflow)
+
+rm(list = ls())
+
+processed <- TRUE
+```
+
+```{r}
+fh <- FileHandler(
+  dir_flow = boxrdrive::box_drive("kline-lab/databackup/Flow Cytometry/Hodgkin/Unmixed All"),
+  dir_export = boxrdrive::box_drive("kline-lab/databackup/Flow Cytometry/Hodgkin/Flowjo_analysis/Export_Xiufen"),
+  dir_input = "input",
+  dir_output = "output",
+  file_meta = "../meta.xlsx",
+  fcs_suffix = "0321_XC"
+  )
+```
+
+```{r}
+if(!processed) {
+  afs <- afterflowset(
+    fh,
+    markers_exclude = c("CD3", "CD19", "Perforin", "LAG3", "KLRG1", "CD62L", "CD127", "dead", "TCF7")
+  )
+  afs <- afterflow_compensate(afs)
+  afs <- afterflow_transform(afs, "lgcl")
+  afs <- afterflowset_batch(afs)
+  afs <- afterflow_scale(afs, TRUE)
+  afs <- afterflow_filter(afs, "POP_CD3+", TRUE)
+  afs <- afterflow_cluster(afs)
+  afs <- afterflow_dimred(afs, method = "umap")
+  saveRDS(afs, "input/afs.RDS")
+} else {
+  afs <- readRDS("input/afs.RDS")
+}
+
+get_colors <- function(colorfile_xls) {
+  get_colors_sheet <- function(sheet) {
+    colorfile_xls %>%
+      read_xlsx(
+        sprintf("%s Clusters", sheet), skip = 1,
+        col_types = c("text", "text", "skip", "text", "text", "skip"),
+        col_names = c("Cluster", "Cluster_Color", "Group", "Group_Color")
+      ) %>%
+      mutate(Data = sheet) %>%
+      return()
+  }
+  bind_rows(lapply(c("All", "T Cell"), get_colors_sheet)) %>%
+    fill(3, 4) %>%
+    return()
+}
+
+
+tib_colors <- get_colors("Hodgkin Figure Colors.xlsx")
+
+sort_order <- c("CD3", "CD4", "CD8", "CD25",
+                "CCR7", "CD62L", "TCF7", "CD127", # CCR7 = SELL, CD127 = IL7R
+                "Ki67",
+                "GZMA", "Perforin",
+                "TNFa", "IFNg", "IL2", "KLRG1", "CD45RA", # CD45RA = PTPRC
+                "TIGIT", "PD-1", "Tim3", "LAG3", # PD-1 = PDCD1, HAVCR2 = Tim3
+                "TOX", "Eomes", "Foxp3", "CD39", # CD39 = ENTPD1
+                "CXCR5",
+                "CD19")
+
+flow_colors <- tib_colors %>%
+  dplyr::select(Cluster, Cluster_Color) %>%
+  unique()
+flow_colors <- setNames(flow_colors$Cluster_Color, flow_colors$Cluster)
+
+flow_colors_g <- tib_colors %>%
+  dplyr::select(Group, Group_Color) %>%
+  unique()
+flow_colors_g <- setNames(flow_colors_g$Group_Color, flow_colors_g$Group)
+
+N_W <- 8
+N_H <- 8
+N_DPI <- 300
+raster <- function(size, fw = 1, fh = NULL) {
+  return(c(
+    size,
+    N_W * N_DPI * fw,
+    ifelse(is.null(fh), N_W * N_DPI * fw, N_W * N_DPI * fh))
+  )
+}
+
+afs@metadata[["Cluster"]] <- factor(
+  afs@metadata[["cluster.id"]],
+  levels = tib_colors$Number,
+  labels = tib_colors$Cluster
+)
+
+afs@metadata[["hodgkin"]] <- factor(
+  afs@metadata[["hodgkin"]],
+  levels = c("RLT", "cHL")
+)
+
+ggft <- theme(
+  plot.title = element_text(size = 30, face = "bold", hjust = 0),
+  plot.subtitle = element_text(size = 20, face = "bold", hjust = 0.5),
+  legend.title = element_text(size = 18, hjust = 0.5),
+  legend.text  = element_text(size = 16)
+)
+```
+
+```{r}
+fig3A_layout <- "
+11236
+11456
+"
+
+fig3A_size <- 3
+fig3A_sub_scale <- 0.5
+
+fig3A1 <- plot_dimred(fh, afs, ggp = TRUE, color = "Cluster",
+                      raster = raster(fig3A_size), cols = alpha(flow_colors, 0.5), 
+                      title = "All Events") + ggft + theme(legend.title = element_blank())
+fig3A2 <- afs %>%
+  afterflow_filter("stim", "Medium") %>%
+  afterflow_filter("hodgkin", "RLT") %>%
+  plot_dimred(af = ., fh = fh, ggp = TRUE, color = "Cluster", leg.pos = "none",
+              raster = raster(fig3A_size, fig3A_sub_scale),
+              cols = alpha(flow_colors, 0.5), title = "Medium", subtitle = "RLT") + ggft
+
+fig3A3 <- afs %>%
+  afterflow_filter("stim", "Medium") %>%
+  afterflow_filter("hodgkin", "cHL") %>%
+  plot_dimred(af = ., fh = fh, ggp = TRUE, color = "Cluster", leg.pos = "none",
+              raster = raster(fig3A_size, fig3A_sub_scale),
+              cols = alpha(flow_colors, 0.5), subtitle = "cHL") + ggft
+
+fig3A4 <- afs %>%
+  afterflow_filter("stim", "P+I") %>%
+  afterflow_filter("hodgkin", "RLT") %>%
+  plot_dimred(af = ., fh = fh, ggp = TRUE, color = "Cluster", leg.pos = "none",
+              raster = raster(fig3A_size, fig3A_sub_scale),
+              cols = alpha(flow_colors, 0.5), title = "P+I", subtitle = "RLT") + ggft
+
+fig3A5 <- afs %>%
+  afterflow_filter("stim", "P+I") %>%
+  afterflow_filter("hodgkin", "cHL") %>%
+  plot_dimred(af = ., fh = fh, ggp = TRUE, color = "Cluster", leg.pos = "none",
+              raster = raster(fig3A_size, fig3A_sub_scale),
+              cols = alpha(flow_colors, 0.5), subtitle = "cHL") + ggft
+
+fig3A <- fig3A1 + fig3A2 + fig3A3 + fig3A4 + fig3A5 + guide_area() +
+  plot_layout(guides = "collect", design = fig3A_layout)
+filehandler_save_figure(fh, fig3A, "Figure_3A_Flow_UMAP_All", "png",
+                        width = N_W * 2.5, height = N_H)
+filehandler_save_figure(fh, fig3A, "Figure_3A_Flow_UMAP_All", "pdf",
+                        width = N_W * 2.5, height = N_H)
+
+figS6A <- plot_heatmap(fh, afs, ggp = TRUE, group = "Cluster", ordering = sort_order, group.colors = flow_colors)
+filehandler_save_figure(fh, figS6A, "Figure_S6A_Flow_Heatmap_All", "png", width = N_W, height = N_H * 1.5)
+filehandler_save_figure(fh, figS6A, "Figure_S6A_Flow_Heatmap_All", "pdf", width = N_W, height = N_H * 1.5)
+
+library(rcompanion)
+
+afs %>%
+  afterflow_data() %>%
+  group_by(Cluster, stim) %>%
+  with(table(Cluster, stim)) %>%
+  chisq.test()
+
+afs %>%
+  afterflow_data() %>%
+  group_by(Cluster, stim) %>%
+  with(table(Cluster, stim)) %>%
+  cramerV()
+
+
+figS2C <- afs %>%
+  afterflow_data() %>%
+  group_by(Cluster, stim) %>%
+  summarise(Percent = n(), .groups = "drop") %>%
+  group_by(stim) %>%
+  mutate(Percent = Percent/sum(Percent)) %>%
+  group_by(Cluster) %>%
+  mutate(Percent = Percent/sum(Percent)*100) %>%
+  ggplot(aes(Cluster, Percent, fill = stim)) +
+    geom_bar(stat = "identity", position = "stack", color = "black") +
+    scale_fill_manual(values = c("Medium" = "#009FFA", "P+I" = "#B20725")) +
+    scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+    theme_bw() +
+    theme(
+      axis.ticks.x = element_blank(),
+      axis.title = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      axis.text = element_text(size = 16),
+      legend.text  = element_text(size = 16),
+      legend.title = element_blank(),
+      legend.position = "right"
+    ) +
+    guides(fill = guide_legend(ncol = 1))
+
+filehandler_save_figure(fh, figS2C, "Figure_S2C_Flow_Barplot_ByStim", "png", width = N_W * 2, height = N_H)
+filehandler_save_figure(fh, figS2C, "Figure_S2C_Flow_Barplot_ByStim", "pdf", width = N_W * 2, height = N_H)
+
+afs %>%
+  afterflow_data() %>%
+  group_by(Cluster, hodgkin) %>%
+  with(table(Cluster, hodgkin)) %>%
+  chisq.test()
+
+afs %>%
+  afterflow_data() %>%
+  group_by(Cluster, hodgkin) %>%
+  with(table(Cluster, hodgkin)) %>%
+  cramerV()
+
+fig3C <- afs %>%
+  afterflow_data() %>%
+  mutate(hodgkin_stim = factor(
+    paste0(hodgkin, " (", stim, ")"),
+    levels = c("RLT (Medium)", "RLT (P+I)", "cHL (Medium)", "cHL (P+I)")
+  )) %>%
+  group_by(Cluster, hodgkin, hodgkin_stim) %>%
+  summarise(Percent = n(), .groups = "drop") %>%
+  group_by(hodgkin) %>%
+  mutate(Percent = Percent/sum(Percent)) %>%
+  group_by(Cluster) %>%
+  mutate(Percent = Percent/sum(Percent)*100) %>%
+  ggplot(aes(Cluster, Percent, fill = hodgkin_stim)) +
+    geom_bar(stat = "identity", position = "stack", color = "black") +
+    scale_fill_manual(values = c(
+      "cHL (Medium)" = "#DD081C",
+      "cHL (P+I)" = "#86081C",
+      "RLT (Medium)" = "#FFDE00",
+      "RLT (P+I)" = "#FFB935"
+    )) +
+    scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+    theme_bw() +
+    theme(
+      axis.ticks.x = element_blank(),
+      axis.title = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      axis.text = element_text(size = 16),
+      legend.text  = element_text(size = 16),
+      legend.title = element_blank(),
+      legend.position = "right"
+    ) +
+    guides(fill = guide_legend(ncol = 1))
+filehandler_save_figure(fh, fig3C, "Figure_3C_Flow_Barplot_ByHodgkinStim", "png", width = N_W * 2, height = N_H)
+filehandler_save_figure(fh, fig3C, "Figure_3C_Flow_Barplot_ByHodgkinStim", "pdf", width = N_W * 2, height = N_H)
+fig3C_orig <- afs %>%
+  afterflow_data() %>%
+  group_by(Cluster, hodgkin) %>%
+  summarise(Percent = n(), .groups = "drop") %>%
+  group_by(hodgkin) %>%
+  mutate(Percent = Percent/sum(Percent)) %>%
+  group_by(Cluster) %>%
+  mutate(Percent = Percent/sum(Percent)*100) %>%
+  ggplot(aes(Cluster, Percent, fill = hodgkin)) +
+    geom_bar(stat = "identity", position = "stack", color = "black") +
+    scale_fill_manual(values = c(
+      "cHL" = "#86081C",
+      "RLT" = "#FFB935"
+    )) +
+    scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+    theme_bw() +
+    theme(
+      axis.ticks.x = element_blank(),
+      axis.title = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.1),
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      panel.background = element_blank(),
+      panel.border = element_blank(),
+      axis.text = element_text(size = 16),
+      legend.text  = element_text(size = 16),
+      legend.title = element_blank(),
+      legend.position = "right"
+    ) +
+    guides(fill = guide_legend(ncol = 1))
+filehandler_save_figure(fh, fig3C_orig, "Figure_3C_Flow_Barplot_ByHodgkin", "png", width = N_W * 2, height = N_H)
+filehandler_save_figure(fh, fig3C_orig, "Figure_3C_Flow_Barplot_ByHodgkin", "pdf", width = N_W * 2, height = N_H)
+
+fig3B <- afs %>%
+  afterflow_data() %>%
+  group_by(Cluster) %>%
+  summarise(Events = n()) %>%
+  ggplot(aes(Cluster, Events, fill = Cluster)) +
+    geom_bar(stat = "identity", position = "stack", color = "black") +
+    scale_fill_manual(values = flow_colors) +
+    theme_bw() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.title.x = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_blank(),
+          axis.text = element_text(size = 16),
+          axis.title = element_text(size = 20),
+          legend.text  = element_text(size = 16),
+          legend.title = element_blank()) +
+    scale_y_continuous(
+      trans = log10_trans(),
+      breaks = trans_breaks("log10", function(x) 10^x),
+      labels = trans_format("log10", math_format(10^.x))
+    )
+
+filehandler_save_figure(fh, fig3B, "Figure_3B_Flow_Barplot_ByEvents", "png", width = N_W * 2, height = N_H)
+filehandler_save_figure(fh, fig3B, "Figure_3B_Flow_Barplot_ByEvents", "pdf", width = N_W * 2, height = N_H)
+
+figS2B <- list()
+
+figS2B_size <- 3
+figS2B_sub_scale <- 0.25
+
+for(clustnum in tib_colors$Number) {
+  cluster <- tib_colors %>% filter(Number == clustnum) %>% pull(Cluster)
+  figS2B[[clustnum]] <- afs %>%
+    afterflow_filter("Cluster", cluster) %>%
+    plot_dimred(af = ., fh = fh, ggp = TRUE, color = "Cluster", leg.pos = "right",
+                raster = raster(figS2B_size, figS2B_sub_scale),
+                cols = alpha(flow_colors, 0.5)) + ggft +
+    theme(
+      plot.subtitle = element_text(size = 9, hjust = 0.5),
+      legend.title = element_blank(),
+      legend.text  = element_text(size = 16)
+    )
+  figS2Bi_title <- sprintf("Figure_S2B_Partial_Flow_UMAP_Cluster_%s",
+                           str_replace(cluster, "\\/", "-"))
+  filehandler_save_figure(fh,
+                          figS2B[[clustnum]] +
+                            theme(legend.position = "none") +
+                            labs(subtitle = cluster),
+                          figS2Bi_title, "png",
+                          width = N_W * figS2B_sub_scale,
+                          height = N_H * figS2B_sub_scale)
+  filehandler_save_figure(fh,
+                          figS2B[[clustnum]] +
+                            theme(legend.position = "none") +
+                            labs(subtitle = cluster),
+                          figS2Bi_title, "pdf",
+                          width = N_W * figS2B_sub_scale,
+                          height = N_H * figS2B_sub_scale)
+}
+
+figS2B_layout <- "
+ABCDPP
+EFGHPP
+IJKLPP
+MNO#PP
+"
+
+figS2B <- wrap_plots(figS2B) + guide_area() +
+  plot_layout(guides = "collect", design = figS2B_layout)
+
+filehandler_save_figure(fh, figS2B, "Figure_S2B_Flow_UMAP_ByCluster", "png", width = N_W * 1.5, height = N_H)
+filehandler_save_figure(fh, figS2B, "Figure_S2B_Flow_UMAP_ByCluster", "pdf", width = N_W * 1.5, height = N_H)
+```

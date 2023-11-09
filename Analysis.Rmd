@@ -1,0 +1,1789 @@
+---
+title: "Hodgkin Analysis"
+output: html_notebook
+---
+
+```{r Packages + Global Vars}
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(scRepertoire))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(readxl))
+suppressPackageStartupMessages(library(vegan))
+suppressPackageStartupMessages(library(patchwork))
+suppressPackageStartupMessages(library(scales))
+suppressPackageStartupMessages(library(SeuratWrappers))
+suppressPackageStartupMessages(library(GGally))
+suppressPackageStartupMessages(library(circlize))
+suppressPackageStartupMessages(library(igraph))
+suppressPackageStartupMessages(library(network))
+suppressPackageStartupMessages(library(ggbreak))
+suppressPackageStartupMessages(library(boxrdrive))
+suppressPackageStartupMessages(library(showtext))
+suppressPackageStartupMessages(library(rcompanion))
+suppressPackageStartupMessages(library(DescTools))
+rm(list = ls())
+gc()
+
+showtext_auto()
+showtext_opts(dpi = 300)
+
+STR_DIR_MAIN <- "kline-lab/databackup/"
+STR_DIR_DATA <- paste0(STR_DIR_MAIN, "scRNA/Hodgkin/cellranger")
+STR_DIR_CLINICAL <- paste0(STR_DIR_MAIN, "Clinical + Annotations/Hodgkin")
+
+tib_samples <- box_drive(STR_DIR_CLINICAL, "hodgkin_samples.xlsx") %>%
+  read_xlsx() %>%
+  rename("ID" = "sample_code") %>%
+  mutate(ID = str_replace(ID, "LN", "LT"))
+
+bool_processed <- TRUE
+filter_B <- TRUE
+N_H <- 8
+N_W <- 8
+
+scale_avg_file <- "seurat_avg_scale.rds"
+
+save_scale <- function(seurat) {
+  list(
+    mean = apply(cHL.avg@assays$RNA@data, 1, mean),
+    sd = apply(cHL.avg@assays$RNA@data, 1, sd)
+  ) %>%
+    saveRDS(scale_avg_file)
+}
+
+get_scale <- function() {
+  readRDS(scale_avg_file) %>%
+    return()
+}
+
+ScaleAvg <- function(seurat, assay = "RNA") {
+  DefaultAssay(seurat) <- assay
+  if(!file.exists(scale_avg_file))
+    save_scale(seurat)
+  list_ms <- get_scale()
+  scaled <- sapply(
+    rownames(seurat@assays$RNA@data),
+    function(r)
+      ((seurat@assays$RNA@data[r,] - list_ms[["mean"]][r])/
+        list_ms[["sd"]][r]) %>%
+      sapply(function(x) min(x, 10)) %>%
+      return()) %>%
+    t()
+  colnames(scaled) <- colnames(seurat@assays$RNA@data)
+  rownames(scaled) <- rownames(seurat@assays$RNA@data)
+  SetAssayData(seurat, "scale.data", scaled)
+  return(seurat)
+}
+
+get_colors <- function(colorfile_xls) {
+  get_colors_sheet <- function(sheet) {
+    colorfile_xls %>%
+      read_xlsx(
+        sprintf("%s Clusters", sheet), skip = 1,
+        col_types = c("text", "text", "skip", "text", "text", "skip"),
+        col_names = c("Cluster", "Cluster_Color", "Group", "Group_Color")
+      ) %>%
+      mutate(Data = sheet) %>%
+      return()
+  }
+  bind_rows(lapply(c("All", "T Cell"), get_colors_sheet)) %>%
+    fill(3, 4) %>%
+    return()
+}
+
+
+tib_colors <- get_colors("Hodgkin Figure Colors.xlsx")
+  
+
+PopulateMeta <- function(seurat) {
+  seurat$hodgkin <- grepl("HL", seurat$ID)
+  seurat$CTgeneStrict <- ifelse(grepl("NA", seurat$CTgene), NA_character_, seurat$CTgene)
+  seurat$CTaaStrict <- ifelse(grepl("NA", seurat$CTaa), NA_character_, seurat$CTaa)
+  seurat$FrequencyStrict <- ifelse(grepl("NA", seurat$CTgene), NA_integer_, seurat$Frequency)
+  seurat$FrequencyStrict <- ifelse(grepl("NA", seurat$CTstrict), NA_integer_, seurat$FrequencyS)
+  seurat$FrequencyStrict <- ifelse(is.na(seurat$FrequencyStrict), 0, seurat$FrequencyStrict)
+  seurat$cloneTM <- case_when(seurat$FrequencyStrict > 2 ~ "\u2265 3",
+                           seurat$FrequencyStrict == 2 ~ "= 2",
+                           seurat$FrequencyStrict == 1 ~ "= 1",
+                           TRUE ~ NA_character_)
+  seurat$cloneT <- case_when(seurat$FrequencyStrict > 15 ~ "Large (15 < X)",
+                          seurat$FrequencyStrict > 5 ~ "Medium (5 < X <= 15)",
+                          seurat$FrequencyStrict > 1 ~ "Small (1 < X <= 5)",
+                          seurat$FrequencyStrict == 1 ~ "Single (1 = X)")
+  seurat$cloneT <- factor(seurat$cloneT, levels = c("Single (1 = X)", "Small (1 < X <= 5)", "Medium (5 < X <= 15)", "Large (15 < X)"))
+  return(seurat)
+}
+
+FixMeta <- function(seurat) {
+  for(col in c("batch", "cHL", "ID", "initials")) {
+    seurat[[col]] <- tibble("sample" = seurat$orig.ident) %>%
+      left_join(tib_samples %>% select(all_of(c("sample", col)))) %>%
+      pull(all_of(col))
+  }
+  return(seurat)
+}
+
+list_features = c(
+  "CD3D", "CD3E", "CD3G", "CD247", "CD4", "CD8A", "CD8B", 
+  "FOXP3", "PTPN13",
+  "CCR7", "SELL", "TCF7", "CD40LG", "TNFSF8", "TYMS", "MKI67",
+  "GZMK", "GZMB", "GZMA", "GZMH", "GZMM", "PRF1",
+  "IL21", "TGFB1", "CCL5", "XCL1", "KLRG1", "KLRB1", "EOMES", "ITGAE", "TNF", "IFNG", "IL2", "PTPRC", "CCL4",
+  "TIGIT", "CTLA4", "PDCD1", "HAVCR2", "LAG3", "TBX21", "IL7R",
+  "TOX", "TOX2", "NR4A1", "ENTPD1", "CXCL13", "CXCR5", "FCGR3A",
+  "LYZ", "CD68",
+  "PAX5", "MZB1", "MS4A1", "CD27", "IFNA1", "PRDM1", "SDC1", "IL6R",
+  "CD83", "CD1C", "CD1D", "CCL22", "CD40", "BATF3", "CLEC9A", "LAMP3", "IRF4", "IRF7", "IRF8", "LILRA4", "CD34", "CLEC4C",
+  "ITGAX", "CD14",
+  "FCER1G", "THBD",
+  "CALD1", "MYL9", "CD63", "IGFBP7", "COL6A2", "ENPP3",
+  "VWF",
+  "CD1A", "CD9", "CR2")
+
+list_features_selected = c(
+  "CD4", "CD8A",
+  "CCR7", "SELL", "TCF7", "IL7R",
+  "MKI67",
+  "GZMB", "PRF1",
+  "CCL5", "PRDM1",
+  "TNF", "IFNG", "CCL4", "KLRG1", 
+  "TIGIT", "CTLA4", "PDCD1", "HAVCR2", "LAG3", "CCR4",
+  "TOX", "TBX21", "EOMES", "FOXP3", "ENTPD1",
+  "CXCL13", "TNFSF8", "IL21", "PTPN13", "IL6R", "CXCR5")
+
+DoHeatmap_cHL <- function(seurat, feat = list_features) {
+  DoHeatmap(
+    seurat,
+    assay = "RNA",
+    features = feat,
+    size = 3,
+    draw.lines = FALSE
+  ) +
+    NoLegend() +
+    RotatedAxis() +
+    scale_fill_distiller(type = "div", palette = "RdYlBu") +
+    theme(axis.text.x.bottom = element_blank())
+}
+
+IdentClusters <- function(seurat, seurat.avg, prefix = "") {
+  clusters <- seurat$seurat_clusters %>% levels()
+  for(c in clusters){
+    DoHeatmap_cHL(subset(seurat, idents = c)) %>%
+      ggsave(plot = ., filename = paste0(prefix, ifelse(prefix == "", "", "_"), c, "_heatmap.pdf"))
+  }
+  
+  DoHeatmap_cHL(seurat.avg) %>%
+    ggsave(plot = ., filename = paste0(prefix, ifelse(prefix == "", "", "_"), "clusteravg_heatmap.pdf"))
+  
+  
+  markers <- FindAllMarkers(seurat, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+  markers %>%
+    group_by(cluster) %>%
+    top_n(n = 100, wt = avg_log2FC) %>%
+    writexl::write_xlsx(paste0(prefix, ifelse(prefix == "", "", "_"), "markers.xlsx"))
+}
+
+ResetIdent <- function(seurat) {
+  Idents(seurat) <- seurat[["seurat_clusters"]]
+  return(seurat)
+}
+
+SetIdent <- function(lbls, seurat) {
+  lvls <- lbls %>% str_remove("(\\* )?[0-9]+ - ")
+  names(lvls) <- lbls %>% str_extract("^(\\* )?[0-9]+")
+  if(!any(names(seurat@meta.data) == "seurat_clusters"))
+    seurat[["seurat_clusters"]] <- seurat@active.ident
+  Idents(seurat) <- factor(lvls[as.character(seurat[["seurat_clusters"]] %>% unlist())], levels = lvls)
+  return(seurat)
+}
+
+setwd(box_drive(STR_DIR_DATA))
+
+```
+
+All Cells
+
+```{r All Cells}
+if(!bool_processed) {
+  get_sample <- function(s, tib = tib_samples) {
+    sample_details <- tib %>% filter(sample == s)
+  
+    seurat <- Read10X(paste0("./", s, "-GE/outs/filtered_feature_bc_matrix")) %>%
+      CreateSeuratObject(project = s, min.cells = 3, min.features = 200)
+    if(filter_B) {
+      seurat <- seurat %>% subset(subset = MS4A1 == 0)
+    }
+    seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern = "^MT-")
+    seurat <- seurat %>%
+      subset(subset = 
+               nFeature_RNA > 200 &
+               nFeature_RNA < 2500 &
+               percent.mt < 20
+           ) %>%
+      NormalizeData(normalization.method = "LogNormalize", scale.factor = 1e4) %>%
+      FindVariableFeatures(selection.method = "vst", nfeatures = 2000) %>%
+      AddMetaData(sample_details$batch, "batch") %>%
+      AddMetaData(sample_details$initials, "initials") %>%
+      AddMetaData(sample_details$cHL, "cHL") %>%
+      AddMetaData(sample_details$sample_code, "ID")
+  
+    vdj <- read.csv(paste0("./", s, "-VDJ/outs/filtered_contig_annotations.csv")) %>%
+      combineTCR(samples = s, ID = "cHL", cells = "T-AB")
+    prefix <- paste0(s, "_cHL")
+    vdj[[prefix]]$barcode <- str_remove(vdj[[prefix]]$barcode, paste0(prefix, "_"))
+    clone_levels <- c("Hyperexpanded (100 < X <= 500)", "Large (20 < X <= 100)",
+                      "Medium (5 < X <= 20)", "Small (1 < X <= 5)",
+                      "Single (0 < X <= 1)", NA)
+    seurat <- combineExpression(vdj, seurat, cloneCall = "gene+nt")
+    seurat$CTgeneS <- seurat$CTgene
+    seurat$CTntS <- seurat$CTnt
+    seurat$CTaaS <- seurat$CTaa
+    seurat$CTstrictS <- seurat$CTstrict
+    seurat$cloneTypeS <- factor(seurat$cloneType, levels = clone_levels)
+    seurat$FrequencyS <- seurat$Frequency
+    seurat <- combineExpression(vdj, seurat, cloneCall = "gene")
+    seurat$cloneType <- factor(seurat$cloneType, levels = clone_levels)
+    
+    return(seurat)
+  }
+  
+  list_GE <- sapply(tib_samples$sample, get_sample)
+  
+  # Due to memory constraints, integrating data in groups
+  cHL <- IntegrateData(
+    FindIntegrationAnchors(
+      list_GE[1:5], 
+      anchor.features = SelectIntegrationFeatures(list_GE[1:5])
+    )
+  )
+  
+  list_GE <- list_GE[6:19]
+  gc()
+  
+  n <- ceiling(length(list_GE)/5)
+  
+  for(i in 1:n) {
+    m <- min(5, length(list_GE))
+    cHL2 <- IntegrateData(
+      FindIntegrationAnchors(
+        list_GE[1:m], 
+        anchor.features = SelectIntegrationFeatures(list_GE[1:m])
+      )
+    ) 
+    if(m == length(list_GE))
+      rm(list_GE)
+    else
+      list_GE <- list_GE[(m+1):length(list_GE)]
+    gc()
+  
+    print(i)
+    cHL <- IntegrateData(
+      FindIntegrationAnchors(
+        list(cHL, cHL2), 
+        anchor.features = SelectIntegrationFeatures(list(cHL, cHL2))
+      )
+    ) 
+    
+    rm(cHL2)
+    gc()
+  }
+  
+  DefaultAssay(cHL) <- "integrated"
+  
+  cHL <- FindVariableFeatures(cHL, selection.method = "vst", nfeatures = 2000)
+  cHL <- ScaleData(cHL, verbose = FALSE)
+  cHL <- RunPCA(cHL, npcs = 30, verbose = FALSE)
+  cHL <- RunTSNE(cHL, reduction = "pca", dims = 1:30)
+  cHL <- RunUMAP(cHL, reduction = "pca", dims = 1:30)
+  cHL <- FindNeighbors(cHL, reduction = "pca", dims = 1:30)
+  cHL <- FindClusters(cHL, resolution = 0.5)
+  DefaultAssay(cHL) <- "RNA"
+  cHL <- ScaleData(cHL, assay = "RNA")
+  cHL %>% saveRDS(paste0("seurat_scaled", ifelse(filter_B, "_noB", ""), ".rds"))
+  DefaultAssay(cHL) <- "RNA"
+  cHL.avg <- AverageExpression(cHL, return.seurat = TRUE)
+  cHL.avg %>% saveRDS("seurat_avg_noB.rds")
+} else {
+  cHL <- readRDS(paste0("seurat_scaled", ifelse(filter_B, "_noB", ""), ".rds"))
+  cHL.avg <- readRDS("seurat_avg_noB.rds")
+}
+
+cHL <- FixMeta(cHL)
+cHL <- PopulateMeta(cHL)
+
+orig_clust <- tib_colors %>%
+  filter(Data == "All") %>%
+  pull(Cluster)
+cHL <- SetIdent(orig_clust, cHL)
+cHL.avg <- SetIdent(orig_clust, cHL.avg)
+cHL[["tclusts"]] <- grepl("T", Idents(cHL))
+
+```
+
+```{r All Cell Stats}
+bind_rows(
+  tibble(
+    sample = cHL$ID
+  ) %>%
+    group_by(sample) %>%
+    summarise(
+      num = n()
+    ) %>%
+    summarise(
+      mean = mean(num),
+      med = median(num),
+      total = sum(num)
+    ) %>%
+    mutate(
+      n = "Cells per Sample"
+    ),
+  tibble(
+    reads = cHL$nCount_RNA
+  ) %>%
+    summarise(
+      mean = mean(reads),
+      med = median(reads),
+      total = sum(reads)
+    ) %>%
+    mutate(
+      n = "Reads per Cell"
+    )
+)
+
+tibble(
+  sample = cHL$ID,
+  cHL = cHL$cHL
+) %>%
+  group_by(cHL) %>%
+  summarise(
+    num = n()
+  )
+
+ncol(cHL@assays$RNA)
+nrow(cHL@assays$RNA)
+length(unique(cHL$seurat_clusters))
+
+tib_samples %>%
+  filter(cHL) %>%
+  summarise(
+    Mean_Age = mean(Age, na.rm = TRUE)
+  )
+tib_samples %>%
+  filter(cHL) %>%
+  group_by(Stage) %>%
+  summarise(n = n())
+tib_samples %>%
+  filter(cHL) %>%
+  group_by(Sex) %>%
+  summarise(n = n())
+tib_samples %>%
+  filter(cHL) %>%
+  group_by(Subtype) %>%
+  summarise(n = n())
+tib_samples %>%
+  filter(cHL) %>%
+  group_by(EBER) %>%
+  summarise(n = n())
+
+cbind(cHL@active.ident, cHL@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "All") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "All") %>% pull(Group) %>% unique())) %>%
+  group_by(cHL, Group) %>%
+  with(table(cHL, Group)) %>%
+  chisq.test()
+
+cbind(cHL@active.ident, cHL@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "All") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "All") %>% pull(Group) %>% unique())) %>%
+  group_by(cHL, Group) %>%
+  with(table(cHL, Group)) %>%
+  cramerV()
+
+```
+
+```{r All Cells Figure Setup}
+all_colors <- setNames(
+  pull(filter(tib_colors, Data == "All"), Cluster_Color),
+  pull(filter(tib_colors, Data == "All"), Cluster) %>% str_remove("[0-9]+ \\- ")
+)
+all_colors_g <- setNames(
+  pull(filter(tib_colors, Data == "All"), Group_Color),
+  pull(filter(tib_colors, Data == "All"), Group)
+)
+ggft1ac <- scale_color_manual(values = all_colors)
+ggft1af <- scale_fill_manual(values = all_colors)
+ggft1acg <- scale_color_manual(values = all_colors_g)
+ggft1afg <- scale_fill_manual(values = all_colors_g)
+ggft1b <- scale_color_gradientn(colours = c('lightgrey', 'red'), limits = c(1,max(cHL$FrequencyStrict[!is.na(cHL$FrequencyStrict)])))
+ggft2 <- theme(panel.border = element_blank(), axis.title.x = element_blank(), axis.title.y = element_blank(), axis.line.x = element_blank(), axis.line.y = element_blank(), legend.text=element_text(size=10))
+ggft3 <- scale_y_continuous(breaks = NULL)
+ggft4 <- scale_x_continuous(breaks = NULL)
+ggft5a <- guides(color = "none")
+ggft5b <- guides(color = guide_colorbar("Clonotype Size"))
+ggft6 <- theme(plot.title = element_text(size = 30, face = "bold", hjust = 0),
+               plot.subtitle = element_text(size = 20, face = "bold", hjust = 0.5),
+               legend.title = element_text(size = 18, hjust = 0.5),
+               legend.text  = element_text(size = 16)
+)
+
+```
+
+```{r Figure S1A (UMAP All) + S1B (Heatmap All) + S1C (Cluster Pie All)}
+figS1A_layout <- "
+11112244
+11113344
+"
+
+figS1A1 <- DimPlot(cHL, label = FALSE, raster = TRUE, cols = alpha(all_colors, 0.25),
+                 raster.dpi = c(N_W * 300, N_H * 300), pt.size = 2) + labs(subtitle = "All Cells") +
+  guides(color = guide_legend(ncol = 1)) + ggft2 + ggft3 + ggft4 + ggft6 +
+  scale_fill_manual(values = rep("white", length(levels(cHL@active.ident))))
+figS1A2 <- DimPlot(subset(cHL, subset = hodgkin == FALSE), label = FALSE, repel = TRUE, raster = TRUE, cols = all_colors,
+                   raster.dpi = c(N_W / 2 * 300, N_H / 2 * 300)) + NoLegend() + labs(subtitle = "RLT") +
+  scale_fill_manual(values = rep("white", length(levels(cHL@active.ident)))) + ggft2 + ggft3 + ggft4 + ggft6
+figS1A3 <- DimPlot(subset(cHL, subset = hodgkin == TRUE), label = FALSE, repel = TRUE, raster = TRUE, cols = alpha(all_colors, 0.25),
+                   raster.dpi = c(N_W / 2 * 300, N_H / 2 * 300)) + NoLegend() + labs(subtitle = "cHL") +
+  scale_fill_manual(values = rep("white", length(levels(cHL@active.ident)))) + ggft2 + ggft3 + ggft4 + ggft6
+
+figS1A <- figS1A1 + figS1A2 + figS1A3 + guide_area() +
+  plot_layout(guides = "collect", design = figS1A_layout)
+
+ggsave("Figure_S1A_scRNA_AllSamples_UMAP_Named.png", figS1A, width = N_W * 2, height = N_H)
+ggsave("Figure_S1A_scRNA_AllSamples_UMAP_Named.pdf", figS1A, width = N_W * 2, height = N_H)
+
+figS1B <- DoHeatmap(cHL.avg, assay = "RNA", features = list_features, size = 15 * 5/14,
+                    draw.lines = FALSE, angle = 90, group.colors = all_colors) +
+  RotatedAxis() + 
+  scale_fill_distiller(type = "div", palette = "RdYlBu") +
+  theme(
+    axis.text.x.bottom = element_blank(),
+    axis.text = element_text(size = 13)
+  ) + ggft6 +
+  guides(color = "none")
+
+ggsave("Figure_S1B_scRNA_AllSamples_Heatmap.pdf", figS1B, width = N_W, height = N_H*2)
+ggsave("Figure_S1B_scRNA_AllSamples_Heatmap.png", figS1B, width = N_W, height = N_H*2)
+
+figS1C <- cbind(cHL@active.ident, cHL@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "All") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "All") %>% pull(Group) %>% unique())) %>%
+  group_by(cHL, Group) %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(cHL) %>%
+  arrange(cHL, desc(Group)) %>%
+  mutate(
+    pct = n/sum(n),
+    cHL = factor(ifelse(cHL, "cHL", "RLT"), levels = c("RLT", "cHL")),
+    midpoint = cumsum(pct) - pct/2,
+    labels = sprintf("%0.2f", pct*100)
+  ) %>%
+  ggplot(aes(x = "", y = pct, fill = Group)) +
+    geom_bar(stat = "identity", width = 1, color = "black") +
+    geom_text_repel(
+      aes(x = 1.5, y = midpoint , label = labels), color = "black", force = 1,
+      nudge_x = 0.4, xlim = c(2, 10), size = 3.4
+    ) +
+    coord_polar(theta = "y", start = 0, direction = -1) +
+    facet_wrap(~cHL, ncol = 1) + ggft1afg + ggft2 + ggft3 + ggft6 +
+    labs(fill = "") + guides(fill = guide_legend(ncol = 1)) +
+    theme_bw() +
+    theme(
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      legend.text = element_text(size = 16), 
+      plot.title = element_text(size = 30, face = "bold", hjust = 0),
+      plot.subtitle = element_text(size = 20, face = "bold", hjust = 0.5),
+      strip.text = element_text(size = 20, face = "bold", hjust = 0.5),
+      strip.background = element_blank(),
+      panel.border = element_blank()
+    )
+
+ggsave("Figure_S1C_scRNA_AllSamples_UMAP_ClusterPieChart.pdf", figS1C, width = N_W, height = N_H)
+ggsave("Figure_S1C_scRNA_AllSamples_UMAP_ClusterPieChart.png", figS1C, width = N_W, height = N_H)
+```
+
+T-cells Only
+
+```{r T Cells}
+if(!bool_processed) {
+  cHL_Tclust <- subset(cHL, subset = tclusts)
+  rm(cHL)
+  DefaultAssay(cHL_Tclust) <- "integrated"
+  cHL_Tclust <- FindVariableFeatures(cHL_Tclust, selection.method = "vst", nfeatures = 2000)
+  cHL_Tclust <- ScaleData(cHL_Tclust, verbose = FALSE)
+  cHL_Tclust <- RunPCA(cHL_Tclust, npcs = 30, verbose = FALSE)
+  cHL_Tclust <- RunTSNE(cHL_Tclust, reduction = "pca", dims = 1:30)
+  cHL_Tclust <- RunUMAP(cHL_Tclust, reduction = "pca", dims = 1:30)
+  cHL_Tclust <- FindNeighbors(cHL_Tclust, reduction = "pca", dims = 1:30)
+  cHL_Tclust <- FindClusters(cHL_Tclust, resolution = 0.5)
+  DefaultAssay(cHL_Tclust) <- "RNA"
+  cHL_Tclust <- ScaleData(cHL_Tclust, verbose = FALSE)
+  cHL_Tclust %>% saveRDS("seurat_scaled_tclust.rds")
+  cHL_Tclust.avg <- AverageExpression(cHL_Tclust, return.seurat = TRUE)
+  cHL_Tclust.avg %>% saveRDS("seurat_avg_tclust.rds")
+  DoHeatmap_cHL(cHL_Tclust.avg)
+  DoHeatmap_cHL(cHL_Tclust.avg) + DimPlot(cHL_Tclust, reduction = "umap", label = TRUE, repel = TRUE, raster = FALSE) + FeaturePlot(subset(cHL_Tclust, subset = FrequencyStrict >= 1), reduction = "umap", features = c("FrequencyStrict"), cols = c("lightgrey", "red"), pt.size = 1.5, order = TRUE, combine = FALSE)
+} else {
+  cHL_Tclust <- readRDS("seurat_scaled_tclust_new.rds")
+  cHL_Tclust.avg <- readRDS("seurat_avg_tclust_new.rds")
+}
+
+cHL_Tclust <- PopulateMeta(cHL_Tclust)
+cHL_Tclust <- FixMeta(cHL_Tclust)
+tclust_clusters <- tib_colors %>%
+  filter(Data == "T Cell") %>%
+  pull(Cluster)
+cHL_Tclust <- SetIdent(tclust_clusters, cHL_Tclust)
+cHL_Tclust.avg <- SetIdent(tclust_clusters, cHL_Tclust.avg)
+
+```
+
+```{r Diversity New}
+get_vdj <- function(s, tib = tib_samples) {
+  vdj <- read.csv(paste0("./", s, "-VDJ/outs/filtered_contig_annotations.csv")) %>%
+    combineTCR(samples = s, ID = "cHL")
+  prefix <- paste0(s, "_cHL")
+  vdj[[prefix]]$barcode <- str_remove(vdj[[prefix]]$barcode, paste0(prefix, "_"))
+  return(vdj)
+}
+
+list_vdj <- sapply(tib_samples$sample, get_vdj)
+new_names <- tib_samples$ID
+names(new_names) <- tib_samples$sample
+names(list_vdj) <- new_names[names(list_vdj) %>% str_remove("\\..*")]
+
+tib_sample_names <- readxl::read_xlsx("../Rename_GEO.xlsx", range = "A1:B20") %>%
+  mutate(Rename = str_replace(Rename, "LN", "LT"))
+new_names <- tib_sample_names$Rename
+names(new_names) <- tib_sample_names$`10X Name`
+names(list_vdj) <- new_names[names(list_vdj) %>% str_remove("\\..*")]
+for(sample in names(list_vdj)) {
+  list_vdj[[sample]] <- list_vdj[[sample]] %>%
+    right_join(
+      cHL_Tclust@meta.data %>%
+        bind_cols(tibble(cluster = cHL_Tclust@active.ident)) %>%
+        filter(ID == sample) %>%
+        select(barcode, cHL, cluster) %>%
+        filter(!is.na(barcode)),
+      by = c("barcode")
+    ) %>%
+    mutate(
+      ID = ifelse(cHL, "cHL", "RLT"),
+      sample = new_names[sample]
+    )
+}
+
+plot_diversity <- function(clust = NA) {
+  vdj_diversity <- list_vdj
+  if (!is.na(clust)) {
+    for (s in names(vdj_diversity))
+    vdj_diversity[[s]] <- vdj_diversity[[s]] %>%
+      filter(cluster == clust)
+  }
+  tib_diversity <- clonalDiversity(vdj_diversity, cloneCall = "strict",
+                                 group.by = "sample", split.by = "cluster",
+                                 x.axis = "ID", exportTable = TRUE)
+
+  pdiversity <- c(
+    Shannon = wilcox.test(Shannon ~ ID, data = tib_diversity, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value),
+    Inv.Simpson = wilcox.test(Inv.Simpson ~ ID, data = tib_diversity, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value),
+    Chao = wilcox.test(Chao ~ ID, data = tib_diversity, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value),
+    ACE = wilcox.test(ACE ~ ID, data = tib_diversity, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value),
+    Inv.Pielou = wilcox.test(Inv.Pielou ~ ID, data = tib_diversity, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value)
+  ) %>%
+    round(3)
+  
+  fig2B <- (
+    tib_diversity %>%
+      ggplot(aes(x = ID, y = Shannon)) +
+        geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+        geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+        ylab(paste0("Shannon (p = ", pdiversity["Shannon"], ")")) + theme(axis.title.x = element_blank()) + 
+        theme_bw() +
+        theme(
+          axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          text = element_text(size = 24)
+        )
+    ) + (
+    tib_diversity %>%
+      ggplot(aes(x = ID, y = Inv.Simpson)) +
+        geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+        geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+        ylab(paste0("Inv. Simpson (p = ", pdiversity["Inv.Simpson"], ")")) + theme(axis.title.x = element_blank()) + 
+        theme_bw() +
+        theme(
+          axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          text = element_text(size = 24)
+        )
+    ) + (
+    tib_diversity %>%
+      ggplot(aes(x = ID, y = Chao)) +
+        geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+        geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+        ylab(paste0("Chao (p = ", pdiversity["Chao"], ")")) + theme(axis.title.x = element_blank()) + 
+        theme_bw() +
+        theme(
+          axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          text = element_text(size = 24)
+        )
+    ) + (
+    tib_diversity %>%
+      ggplot(aes(x = ID, y = ACE)) +
+        geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+        geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+        ylab(paste0("ACE (p = ", pdiversity["ACE"], ")")) + theme(axis.title.x = element_blank()) + 
+        theme_bw() +
+        theme(
+          axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          text = element_text(size = 24)
+        )
+    ) + (
+    tib_diversity %>%
+      ggplot(aes(x = ID, y = Inv.Pielou)) +
+        geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+        geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+        ylab(paste0("Inv. Pielou (p = ", pdiversity["Inv.Pielou"], ")")) + theme(axis.title.x = element_blank()) + 
+        theme_bw() +
+        theme(
+          axis.title.x = element_blank(),
+          panel.grid = element_blank(),
+          text = element_text(size = 24)
+        )
+    ) + 
+    plot_layout(ncol = 5)
+  
+  if (is.na(clust)) {
+    ggsave("Figure_2B_scRNA_TCells_Diversity.pdf", fig2B, width = N_W*2, height = N_H)
+    ggsave("Figure_2B_scRNA_TCells_Diversity.png", fig2B, width = N_W*2, height = N_H)
+  } else {
+    ggsave(
+      sprintf("Figure_Supplement_scRNA_TCells_Diversity_%s.pdf", clust),
+      fig2B, width = N_W*2, height = N_H
+    )
+    ggsave(
+      sprintf("Figure_Supplement_scRNA_TCells_Diversity_%s.png", clust),
+      fig2B, width = N_W*2, height = N_H
+    )
+  }
+
+
+}
+plot_diversity()
+
+for (clust in levels(list_vdj$HL1$cluster)) {
+  plot_diversity(clust)
+}
+
+```
+
+```{r T Cell Stats}
+bind_rows(
+  tibble(
+    sample = cHL_Tclust$ID
+  ) %>%
+    group_by(sample) %>%
+    summarise(
+      num = n()
+    ) %>%
+    summarise(
+      mean = mean(num),
+      med = median(num),
+      total = sum(num)
+    ) %>%
+    mutate(
+      n = "Cells per Sample"
+    ),
+  tibble(
+    reads = cHL_Tclust$nCount_RNA
+  ) %>%
+    summarise(
+      mean = mean(reads),
+      med = median(reads),
+      total = sum(reads)
+    ) %>%
+    mutate(
+      n = "Reads per Cell"
+    ),
+  tibble(
+    frequency = cHL_Tclust$FrequencyStrict
+  ) %>%
+    summarise(
+      mean = mean(frequency > 0),
+      med = 1,
+      total = sum(frequency > 0)
+    ) %>%
+    mutate(
+      n = "Clonotype Sizes"
+    ),
+  tibble(
+    clonotype_frequency = cHL_Tclust$FrequencyStrict,
+    clonotype = cHL_Tclust$CTgeneStrict
+  ) %>%
+    unique() %>%
+    select(-clonotype) %>%
+    summarise(
+      mean = mean(clonotype_frequency),
+      med = median(clonotype_frequency),
+      total = sum(clonotype_frequency > 0)
+    ) %>%
+    mutate(
+      n = "Cells per Sample"
+    )
+)
+
+
+cbind(cHL_Tclust@active.ident, cHL_Tclust@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL_Tclust@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "T Cell") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "T Cell") %>% pull(Group) %>% unique())) %>%
+  select(cHL, Group) %>%
+  with(table(cHL, Group)) %>%
+  chisq.test()
+
+cbind(cHL_Tclust@active.ident, cHL_Tclust@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL_Tclust@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "T Cell") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "T Cell") %>% pull(Group) %>% unique())) %>%
+  select(cHL, Group) %>%
+  with(table(cHL, Group)) %>%
+  cramerV()
+
+cbind(cHL_Tclust@active.ident, cHL_Tclust@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL_Tclust@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "T Cell") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  select(cHL, Cluster) %>%
+  with(table(cHL, Cluster)) %>%
+  chisq.test()
+
+cbind(cHL_Tclust@active.ident, cHL_Tclust@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL_Tclust@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "T Cell") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  select(cHL, Cluster) %>%
+  with(table(cHL, Cluster)) %>%
+  cramerV()
+
+```
+
+```{r T Cells Figure Setup}
+tib_t_colors <- tib_colors %>%
+  filter(Data == "T Cell")
+t_colors <- setNames(tib_t_colors$Cluster_Color,
+                     str_remove(tib_t_colors$Cluster, "[0-9]+ \\- "))
+tib_t_colors_g <- tib_t_colors %>%
+  select(Group, Group_Color) %>%
+  unique()
+t_colors_g <- setNames(tib_t_colors_g$Group_Color, tib_t_colors_g$Group)
+ggft1ac <- scale_color_manual(values = t_colors)
+ggft1af <- scale_fill_manual(values = t_colors)
+ggft1acg <- scale_color_manual(values = t_colors_g)
+ggft1afg <- scale_fill_manual(values = t_colors_g)
+ggft1b <- scale_color_gradientn(colours = c('lightgrey', 'red'),
+                                limits = c(1,max(cHL_Tclust$FrequencyStrict[!is.na(cHL_Tclust$FrequencyStrict)])),
+                                breaks = c(1,max(cHL_Tclust$FrequencyStrict[!is.na(cHL_Tclust$FrequencyStrict)])))
+ggft2 <- theme(panel.border = element_blank(), axis.title.x = element_blank(), axis.title.y = element_blank(), axis.line.x = element_blank(), axis.line.y = element_blank(), legend.text=element_text(size=10))
+ggft3 <- scale_y_continuous(breaks = NULL)
+ggft4 <- scale_x_continuous(breaks = NULL)
+ggft5a <- guides(color = FALSE)
+ggft5b <- guides(color = guide_colorbar("Clonotype Size"))
+ggft6 <- theme(plot.title = element_text(size = 30, face = "bold", hjust = 0),
+               plot.subtitle = element_text(size = 20, face = "bold", hjust = 0.5),
+               legend.title = element_text(size = 18, hjust = 0.5),
+               legend.text  = element_text(size = 16)
+)
+
+```
+
+```{r Figure 2E (Clonotype Map/Graph)}
+i2xy <- function(i, n) {
+  deg <- 2 * (i-1)/n
+  return(c(sinpi(deg), cospi(deg)))
+}
+
+get_ggnet <- function(allpts = TRUE, scale = TRUE, comb = TRUE,
+                      cHL = character(), center = character()) {
+  clust <- cHL_Tclust@active.ident
+  
+  if(comb)
+    clust <- clust %>%
+      as.character() %>%
+      str_remove(" \\(.*") %>%
+      factor(levels = levels(clust) %>%
+        str_remove(" \\(.*") %>%
+        unique())
+  
+  clonotype_list <- tibble(
+    id = cHL_Tclust@meta.data$ID,
+    ct = cHL_Tclust@meta.data$CTgeneStrict,
+    name = clust,
+    hodgkin = cHL_Tclust@meta.data$cHL
+  ) %>%
+    filter(!is.na(ct), !is.na(name)) %>%
+    group_by(id, ct, name, hodgkin) %>%
+    summarise(size = n(), .groups = "drop") %>%
+    group_by(id, ct, hodgkin) %>%
+    mutate(total = sum(size)) %>%
+    filter(total > 1)
+  
+  graph_lvls <- levels(clust)
+  circle_lvls <- graph_lvls
+  center_pos <- c()
+  if(length(center) > 0) {
+    clonotype_list <- clonotype_list %>%
+      filter(sum(name == center) > 0)
+    circle_lvls <- circle_lvls[circle_lvls != center]
+    center_pos <- c(0, 0)
+  }
+  positions <- sapply(seq(length(circle_lvls)), i2xy, length(circle_lvls)) %>%
+    t()
+
+  positions <- rbind(center_pos, positions)
+  rownames(positions) <- c(center, circle_lvls)
+  
+  
+  if(comb) {
+    grid.col <- t_colors_g
+  } else {
+    grid.col <- t_colors
+  }
+  
+  get_ggn <- function(tib) {
+    scale_n <- length(unique(tib$id))
+    clonotype_edges <- full_join(
+      tib %>% mutate(name = as.integer(name)),
+      tib %>% mutate(name = as.integer(name)),
+      by = c("ct", "id", "total"),
+      suffix = c("1", "2")
+    ) %>%
+      filter(name1 != name2) %>%
+      mutate(
+        from = if_else(name1 > name2, name1, name2),
+        to = if_else(name1 < name2, name1, name2)
+      ) %>%
+      mutate(value = size1 * size2/(total - size1)) %>%
+      group_by(from, to) %>%
+      summarise(
+        weight = n(),
+        value = sum(value),
+        .groups = "drop"
+      ) %>%
+      unique()
+    
+    clonotype_vertices <- tib %>%
+      group_by(name) %>%
+      summarise(size = sum(size), .groups = "drop") %>%
+      unique() %>%
+      arrange(name) %>%
+      mutate(id = as.integer(name)) %>%
+      relocate(id) %>%
+      dplyr::rename(label = name) %>%
+      mutate(label = as.character(label)) %>%
+      mutate(size = 2 + size/scale_n*10)
+    
+    
+  
+    
+    clonotype_edges <- clonotype_edges %>%
+      mutate(
+        weight_size = weight/scale_n/5,
+        value_size = value/scale_n/5
+      )
+    
+    clonotype_vertices <- clonotype_vertices %>%
+      mutate(size = 5 + size/scale_n/10)
+    
+    ms <- max(clonotype_vertices$size)
+    
+    ggn <- network(clonotype_edges, vertices = clonotype_vertices,
+            matrix.type = "edgelist", directed = FALSE) %>%
+      ggnet2(node.size = "size",
+             node.color = "label", palette = grid.col, max_size = ms,
+             edge.size = sprintf("%s_size", ifelse(scale, "value", "weight")),
+             edge.alpha = 0.5,
+             mode = positions[clonotype_vertices$label,],
+             color.legend = ifelse(comb, "Phenotype", "Cluster")) +
+      guides(color = guide_legend(override.aes = list(size = 5)),
+             size = "none")
+    
+    return(ggn)
+  }
+  
+  if (allpts) {
+    return(get_ggn(clonotype_list))
+  } else {
+    if(cHL == "cHL") {
+      return(get_ggn(filter(clonotype_list, hodgkin)))
+    } else {
+      return(get_ggn(filter(clonotype_list, !hodgkin)))
+    }
+  }
+
+}
+
+
+
+  
+net_layout <- "
+11225
+33445
+"
+
+fig2E <- (
+  (get_ggnet(allpts = FALSE, scale = TRUE, comb = TRUE, cHL = "RLT") +
+     guides(color = guide_legend(ncol = 1,
+                                 override.aes = list(size = 8))) +
+     labs(title = "Clonotypes shared across all phenotypes", subtitle = "RLT") +
+     theme(
+        legend.title = element_text(size = 26, hjust = 0.5),
+        legend.text  = element_text(size = 24)
+     )) +
+    (get_ggnet(allpts = FALSE, scale = TRUE, comb = TRUE, cHL = "cHL") +
+       guides(color = "none") +
+       labs(subtitle = "cHL")) +
+    (get_ggnet(allpts = FALSE, scale = TRUE, comb = TRUE, cHL = "RLT", 
+              center = "Effector CD8 T") +
+       guides(color = "none") +
+       labs(title = "Clonotypes shared with effector CD8+ T cells", subtitle = "RLT"))+
+    (get_ggnet(allpts = FALSE, scale = TRUE, comb = TRUE, cHL = "cHL", 
+              center = "Effector CD8 T") +
+       guides(color = "none") +
+       labs(subtitle = "cHL")) +
+    guide_area()
+) + plot_layout(design = net_layout, guides = "collect") &
+  theme(
+    plot.title = element_text(size = 26, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 24, face = "bold", hjust = 0.5)
+  )
+
+ggsave("Figure_2E_scRNA_TCells_ClonotypeNetworkGraph.png", fig2E,
+         width = N_W*2.5, height = N_H*2)
+ggsave("Figure_2E_scRNA_TCells_ClonotypeNetworkGraph.pdf", fig2E,
+       width = N_W*2.5, height = N_H*2)
+
+fig2ESupp <- (
+  (get_ggnet(allpts = FALSE, scale = TRUE, comb = FALSE, cHL = "RLT") +
+     guides(color = guide_legend(ncol = 1,
+                                 override.aes = list(size = 8))) +
+     labs(title = "Clonotypes shared across all phenotypes", subtitle = "RLT") +
+     theme(
+        legend.title = element_text(size = 26, hjust = 0.5),
+        legend.text  = element_text(size = 24)
+     )) +
+    (get_ggnet(allpts = FALSE, scale = TRUE, comb = FALSE, cHL = "cHL") +
+       guides(color = "none") +
+       labs(subtitle = "cHL")) +
+    (get_ggnet(allpts = FALSE, scale = TRUE, comb = FALSE, cHL = "RLT", 
+              center = "Effector CD8 T") +
+       guides(color = "none") +
+       labs(title = "Clonotypes shared with effector CD8+ T cells", subtitle = "RLT"))+
+    (get_ggnet(allpts = FALSE, scale = TRUE, comb = FALSE, cHL = "cHL", 
+              center = "Effector CD8 T") +
+       guides(color = "none") +
+       labs(subtitle = "cHL")) +
+    guide_area()
+) + plot_layout(design = net_layout, guides = "collect") &
+  theme(
+    plot.title = element_text(size = 26, face = "bold", hjust = 0),
+    plot.subtitle = element_text(size = 24, face = "bold", hjust = 0.5)
+  )
+
+ggsave("Figure_Supplement_scRNA_TCells_ClonotypeNetworkGraph_ByCluster.png", fig2ESupp,
+         width = N_W*2.5, height = N_H*2)
+ggsave("Figure_Supplement_scRNA_TCells_ClonotypeNetworkGraph_ByCluster.pdf", fig2ESupp,
+       width = N_W*2.5, height = N_H*2)
+```
+
+```{r Figure 1D (Cluster Pie T)}
+
+fig1D <- cbind(cHL_Tclust@active.ident, cHL_Tclust@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL_Tclust@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "T Cell") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "T Cell") %>% pull(Group) %>% unique())) %>%
+  group_by(cHL, Group) %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(cHL) %>%
+  arrange(cHL, desc(Group)) %>%
+  mutate(
+    pct = n/sum(n),
+    cHL = factor(ifelse(cHL, "cHL", "RLT"), levels = c("RLT", "cHL")),
+    midpoint = cumsum(pct) - pct/2,
+    labels = sprintf("%0.1f", pct*100)
+  ) %>%
+  ggplot(aes(x = "", y = pct, fill = Group)) +
+    geom_bar(stat = "identity", width = 1, color = "black") +
+    geom_text_repel(
+      aes(x = 1.5, y = midpoint , label = labels), color = "black", force = 1,
+      nudge_x = 0.4, xlim = c(2, 12), size = 4.5
+    ) +
+    coord_polar(theta = "y", start = 0, direction = -1) +
+    facet_wrap(~cHL, ncol = 1) + ggft1afg + ggft2 + ggft3 + ggft6 +
+    labs(fill = "") + guides(fill = guide_legend(ncol = 1)) +
+    theme_bw() +
+    theme(
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      strip.background = element_blank(),
+      panel.border = element_blank(),
+      legend.text = element_text(size = 16),
+      strip.text = element_text(size = 20)
+    )
+
+
+ggsave("Figure_1D_scRNA_TCells_UMAP_ClusterPieChart.pdf", fig1D, width = N_W, height = N_H)
+ggsave("Figure_1D_scRNA_TCells_UMAP_ClusterPieChart.png", fig1D, width = N_W, height = N_H)
+
+fig1DSupp <- cbind(cHL_Tclust@active.ident, cHL_Tclust@meta.data) %>%
+  as_tibble() %>%
+  dplyr::rename(Cluster = `cHL_Tclust@active.ident`) %>%
+  mutate(Cluster = as.character(Cluster)) %>%
+  left_join(
+    tib_colors %>%
+      filter(Data == "T Cell") %>%
+      mutate(Cluster = str_remove(Cluster, "[0-9]+ \\- ")),
+    by = "Cluster") %>%
+  mutate(Group = factor(Group, tib_colors %>% filter(Data == "T Cell") %>% pull(Group) %>% unique())) %>%
+  group_by(cHL, Cluster) %>%
+  summarise(n = n()) %>%
+  ungroup() %>%
+  group_by(cHL) %>%
+  arrange(cHL, desc(Cluster)) %>%
+  mutate(
+    pct = n/sum(n),
+    cHL = factor(ifelse(cHL, "cHL", "RLT"), levels = c("RLT", "cHL")),
+    midpoint = cumsum(pct) - pct/2,
+    labels = sprintf("%0.1f", pct*100)
+  ) %>%
+  ggplot(aes(x = "", y = pct, fill = Cluster)) +
+    geom_bar(stat = "identity", width = 1, color = "black") +
+    geom_text_repel(
+      aes(x = 1.5, y = midpoint , label = labels), color = "black", force = 1,
+      nudge_x = 0.4, xlim = c(2, 12), size = 4.5
+    ) +
+    coord_polar(theta = "y", start = 0, direction = -1) +
+    facet_wrap(~cHL, ncol = 1) + ggft1af + ggft2 + ggft3 + ggft6 +
+    labs(fill = "") + guides(fill = guide_legend(ncol = 1)) +
+    theme_bw() +
+    theme(
+      axis.title = element_blank(),
+      axis.ticks = element_blank(),
+      panel.grid = element_blank(),
+      legend.position = "right",
+      strip.background = element_blank(),
+      panel.border = element_blank(),
+      legend.text = element_text(size = 16),
+      strip.text = element_text(size = 20)
+    )
+
+
+ggsave("Figure_Supplement_scRNA_TCells_UMAP_ClusterPieChart_ByCluster.pdf", fig1DSupp, width = N_W, height = N_H)
+ggsave("Figure_Supplement_scRNA_TCells_UMAP_ClusterPieChart_ByCluster.png", fig1DSupp, width = N_W, height = N_H)
+
+```
+
+```{r Clonotype Stats}
+bigClonotypes <- subset(cHL_Tclust, subset = FrequencyStrict > 0)
+
+clonotypeList <- tibble(
+  sample = bigClonotypes$ID,
+  cluster = bigClonotypes$seurat_clusters,
+  frequency = bigClonotypes$cloneT
+) %>% group_by(sample, cluster, frequency) %>%
+  summarise(count = n()) %>%
+  ungroup()
+
+rm(bigClonotypes)
+
+clonotypeListSample <- clonotypeList %>%
+  group_by(sample, frequency) %>%
+  summarise(count = sum(count)) %>%
+  ungroup() %>%
+  group_by(sample) %>%
+  mutate(pct = count/sum(count)*100.0) %>%
+  group_by(sample) %>%
+  arrange(desc(pct), .by_group = TRUE) %>%
+  select(-count)
+
+
+clonotypeOrder <- clonotypeListSample %>% spread(frequency, pct) %>% arrange(desc(`Large (15 < X)`), desc(`Medium (5 < X <= 15)`), desc(`Single (1 = X)`))
+
+clonotypeListSample$sample <- factor(x = clonotypeListSample$sample, levels = clonotypeOrder$sample)
+```
+
+```{r Figures 1B (UMAP T) + 1C (Heatmap T) + 1E/Extra (Cluster cHL/RLT T)}
+fig1B_layout <- "
+11111122244
+11111133344
+"
+
+fig1B1 <- DimPlot(cHL_Tclust, label = FALSE, raster = TRUE, cols = alpha(t_colors, 0.25),
+                 raster.dpi = c(N_W * 300, N_H * 300), pt.size = 2) + labs(subtitle = "All T Cells") +
+  guides(color = guide_legend(ncol = 1, override.aes = list(size = 5))) + ggft2 + ggft3 + ggft4 + ggft6 +
+  scale_fill_manual(values = rep("white", length(levels(cHL_Tclust@active.ident))))
+fig1B2 <- DimPlot(subset(cHL_Tclust, subset = hodgkin == FALSE), label = FALSE, repel = TRUE, raster = TRUE, cols = t_colors,
+                   raster.dpi = c(N_W / 2 * 300, N_H / 2 * 300)) + NoLegend() + labs(subtitle = "RLT") +
+  scale_fill_manual(values = rep("white", length(levels(cHL_Tclust@active.ident)))) + ggft2 + ggft3 + ggft4 + ggft6
+fig1B3 <- DimPlot(subset(cHL_Tclust, subset = hodgkin == TRUE), label = FALSE, repel = TRUE, raster = TRUE, cols = alpha(t_colors, 0.25),
+                   raster.dpi = c(N_W / 2 * 300, N_H / 2 * 300)) + NoLegend() + labs(subtitle = "cHL") +
+  scale_fill_manual(values = rep("white", length(levels(cHL_Tclust@active.ident)))) + ggft2 + ggft3 + ggft4 + ggft6
+
+fig1B <- fig1B1 + fig1B2 + fig1B3 + guide_area() +
+  plot_layout(guides = "collect", design = fig1B_layout) &
+  theme(legend.text = element_text(size = 16))
+
+ggsave("Figure_1B_scRNA_TCells_UMAP_Named.pdf", fig1B, width = N_W*1.75, height = N_H)
+ggsave("Figure_1B_scRNA_TCells_UMAP_Named.png", fig1B, width = N_W*1.75, height = N_H)
+
+fig1C <- DoHeatmap(cHL_Tclust.avg, assay = "RNA",
+                   features = list_features_selected, size = 6,
+                   draw.lines = FALSE, angle = 90, group.colors = t_colors) +
+  RotatedAxis() + 
+  scale_fill_distiller(type = "div", palette = "RdYlBu") + ggft6 +
+  theme(
+    axis.text.x.bottom = element_blank(),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+    axis.text.y = element_text(face = "bold.italic", size = 16)
+  ) +
+  guides(color = "none")
+
+ggsave("Figure_1C_scRNA_TCells_Heatmap.pdf", fig1C, width = N_W, height = N_H*1.75)
+ggsave("Figure_1C_scRNA_TCells_Heatmap.png", fig1C, width = N_W, height = N_H*1.75)
+
+fig1E <- tibble(sample = cHL_Tclust$ID, cluster = cHL_Tclust@active.ident, hodgkin = cHL_Tclust$cHL) %>%
+  mutate(hodgkin = if_else(hodgkin, "cHL", "RLT") %>%
+           factor(levels = c("RLT", "cHL"))) %>%
+  group_by(cluster, hodgkin) %>% summarise(clustern = n()) %>%
+  group_by(hodgkin) %>% mutate(clustern = clustern/sum(clustern)) %>%
+  group_by(cluster) %>% mutate(pct = clustern/sum(clustern)) %>%
+  ggplot(aes(x = cluster, pct, fill = hodgkin)) +
+    geom_bar(position = "fill", stat = "identity", color = "black") +
+    scale_y_continuous(labels=scales::percent, expand = c(0,0)) +
+    scale_fill_manual(values = c("cHL" = "#86081C", "RLT" = "#FFB935")) +
+    theme_bw() +
+    theme(
+      panel.border = element_blank(),
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "bottom"
+    ) +
+    RotatedAxis() + ggft6 + ggft2 + theme(legend.title = element_blank())
+
+ggsave("Figure_1Extra_scRNA_TCells_Cluster_cHLProportions.pdf", fig1E, width = N_W*2, height = N_H)
+ggsave("Figure_1Extra_scRNA_TCells_Cluster_cHLProportions.png", fig1E, width = N_W*2, height = N_H)
+```
+
+```{r Figures 2A (Clone size cHL/RLT) + 2C (Clone size UMAP by sample) + 2D (Clone size bar plot) + S3 (Per sample UMAP)}
+
+fig2B <- FeaturePlot(
+  subset(cHL_Tclust, subset = FrequencyStrict >= 1),
+  features = c("FrequencyStrict"), cols = c("lightgrey", "red"),
+  split.by = "hodgkin", pt.size = 10, order = TRUE, combine = FALSE,
+  raster = TRUE, raster.dpi = c(N_W * 300, N_H * 300)
+)
+fig2B[[1]] <- fig2B[[1]] + ggft1b + ggft2 + ggft3 + ggft4 + ggft5a + ggft6 + ggtitle("RLT")
+fig2B[[2]] <- fig2B[[2]] + ggft1b + ggft2 + ggft3 + ggft4 + ggft5b + ggft6 + ggtitle("cHL")
+fig2B <- fig2B[[1]] | fig2B[[2]] & theme(legend.text = element_text(size = 18))
+
+ggsave("Figure_2B_scRNA_TCells_UMAP_ClonotypeSizes_byHodgkin.pdf", fig2B, width = N_W*2, height = N_H)
+ggsave("Figure_2B_scRNA_TCells_UMAP_ClonotypeSizes_byHodgkin.png", fig2B, width = N_W*2, height = N_H)
+
+clonotypeListSampleAnn <- clonotypeListSample %>%
+  left_join(
+    tib_samples %>%
+      mutate(
+        HLA = ifelse(grepl("Absent", `HLA-ABC+`), "‡", ifelse(grepl("Reduced", `HLA-ABC+`), "†", "")),
+        PDL1 = ifelse(!grepl("[0-9]", `PD-L1`), "", "#"),
+        EBV = ifelse(is.na(EBER), "", ifelse(EBER == "TRUE", "*", "")),
+        Patient = paste0(ID, HLA, PDL1, EBV)
+      ) %>%
+      select(sample = ID, Patient)
+  ) %>%
+  mutate(
+    Patient = factor(
+      Patient,
+      levels = pivot_wider(., id_cols = c("sample", "Patient"), names_from = frequency, values_from = pct) %>%
+        arrange(
+          desc(`Large (15 < X)`),
+          desc(`Medium (5 < X <= 15)`),
+          desc(`Small (1 < X <= 5)`)
+        ) %>%
+        pull(Patient)
+      )
+    )
+
+freq_palette <- c("#FFE239", "#FFB935", "#FF8735", "#DE0D2E")
+names(freq_palette) <- levels(clonotypeListSampleAnn$frequency)
+freq_palette <- freq_palette[2:4]
+
+fig2C <- clonotypeListSampleAnn %>%
+  filter(!grepl("Single", frequency)) %>%
+  mutate(frequency = factor(as.character(frequency), levels = levels(frequency)[2:4])) %>%
+  mutate(pct = pct/100) %>%
+  ggplot(aes(fill=frequency, y=pct, x=Patient)) + 
+    geom_bar(stat="identity", color = "black") +
+    scale_y_continuous(labels = scales::percent, expand = c(0,0), limits = c(0, 0.3),
+                       breaks = seq(0, 0.3, 0.05), minor_breaks = NULL) + 
+    scale_fill_manual(values = freq_palette) +
+    theme_bw() + theme(
+      panel.border = element_blank(),
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "right"
+    ) +
+    ggft2 + labs(fill = "Clonotype Size") + ggft6 + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+#    scale_y_break(c(0.325, 0.925), expand = FALSE) +
+    labs(caption = "† HLA Class I Reduced; ‡ HLA Class I Absent; # PD-L1 IHC+; * EBER+") +
+    guides(fill = guide_legend(override.aes = list(size = 8))) +
+    theme(axis.text = element_text(size = 14),
+          legend.title = element_text(size = 20),
+          legend.text = element_text(size = 16),
+          plot.caption = element_text(size = 16))
+
+ggsave("Figure_2C_scRNA_TCells_Samples_ClonotypeSizes.pdf", fig2C, width = N_W*2, height = N_H)
+ggsave("Figure_2C_scRNA_TCells_Samples_ClonotypeSizes.png", fig2C, width = N_W*2, height = N_H)
+
+tib_mappings <- tibble(
+  UMAP_1 = cHL_Tclust@reductions$umap@cell.embeddings[,1],
+  UMAP_2 = cHL_Tclust@reductions$umap@cell.embeddings[,2],
+  ident = cHL_Tclust@active.ident,
+  FrequencyStrict = cHL_Tclust$FrequencyStrict,
+  ID = cHL_Tclust$ID
+)
+
+
+lvls_na <- "Non-Expanded Clonotype"
+lvls_id <- c(paste0("HL", 1:14), paste0("LN", 1:5))
+
+id_cols <- (
+  RColorBrewer::brewer.pal(
+    RColorBrewer::brewer.pal.info["Set1","maxcolors"],
+    name = "Set1"
+  ) %>%
+    colorRampPalette()
+)(length(lvls_id))
+id_cols <- c("lightgrey", id_cols)
+names(id_cols) <- c(lvls_na, lvls_id)
+
+cHL_Tclust@meta.data[["ClonotypesID_Large"]] <- case_when(
+  cHL_Tclust@meta.data[["FrequencyStrict"]] > 15 ~ cHL_Tclust@meta.data[["ID"]],
+  TRUE ~ lvls_na
+) %>%
+  factor(levels = c(lvls_na, lvls_id))
+cHL_Tclust@meta.data[["ClonotypesID_Medium"]] <- case_when(
+  cHL_Tclust@meta.data[["FrequencyStrict"]] > 5 ~ cHL_Tclust@meta.data[["ID"]],
+  TRUE ~ lvls_na
+) %>%
+  factor(levels = c(lvls_na, lvls_id))
+
+plot_large_clones <- DimPlot(cHL_Tclust, group.by = "ClonotypesID_Large", pt.size = 10,
+        repel = TRUE, order = TRUE, raster = TRUE,
+        raster.dpi = c(N_W * 300, N_H * 300)) + 
+        scale_colour_manual(values = id_cols[names(id_cols) %in% cHL_Tclust@meta.data[["ClonotypesID_Large"]]]) +
+        ggft2 + ggft3 + ggft4 + ggft6 + ggtitle("") +
+        theme(legend.position = "right", legend.text = element_text(size = 16)) +
+        guides(color = guide_legend(override.aes = list(size = 5)))
+plot_large_clones_title <- "Figure_2D_scRNA_TCells_UMAP_ClonotypeSizes_LargeByID"
+ggsave(
+  paste0(plot_large_clones_title, ".pdf"),
+  plot_large_clones,
+  width = N_W*1.25, height = N_H
+)
+ggsave(
+  paste0(plot_large_clones_title, ".png"),
+  plot_large_clones,
+  width = N_W*1.25, height = N_H
+)
+
+# freq_plots <- FeaturePlot(cHL_Tclust, features = c("FrequencyStrict"),
+#                           cols = c("lightgrey", "red"), pt.size = 10,
+#                           order = TRUE, split.by = "ID", combine = FALSE,
+#                           raster = TRUE, raster.dpi = c(N_W * 300, N_H * 300))
+# freq_plot_names <- rep("", 19)
+# for(i in 1:length(freq_plots)) {
+#   freq_plot_names[i] <- freq_plots[[i]]$data %>%
+#     as_tibble() %>%
+#     left_join(tib_mappings, by = c("UMAP_1", "UMAP_2", "ident", "FrequencyStrict")) %>%
+#     pull(ID) %>%
+#     unique()
+# }
+# names(freq_plots) <- freq_plot_names
+# 
+# for(s in unique(cHL_Tclust$ID)) {
+#   figS3 <- (DimPlot(subset(cHL_Tclust, subset = ID == s), pt.size = 8,
+#                     repel = TRUE, raster = TRUE, cols = alpha(t_colors, 0.25),
+#                     raster.dpi = c(N_W * 300, N_H * 300)) +
+#       ggft2 + ggft3 + ggft4 + ggft6 + ggtitle(s) +
+#        theme(legend.position = "right")) + 
+#     (freq_plots[[s]] + ggft2 + ggft3 + ggft4 + ggft6 + ggtitle("") +
+#        theme(legend.position = "right"))
+#   ggsave(
+#     paste0("Figure_S3_scRNA_TCells_UMAP_CloneSizes_", s, ".pdf"),
+#     figS3,
+#     width = N_W*2, height = N_H
+#   )
+#   ggsave(
+#     paste0("Figure_S3_scRNA_TCells_UMAP_CloneSizes_", s, ".png"),
+#     figS3,
+#     width = N_W*2, height = N_H
+#   )
+#   rm(figS3)
+# }
+
+```
+
+```{r Figure S3 (Violin plots)}
+cHL_Tclust$Group <- tibble(Cluster = cHL_Tclust@active.ident) %>%
+  left_join(tib_t_colors %>% mutate(Group = factor(Group, levels = unique(Group))), by = "Cluster") %>%
+  pull(Group)
+
+figS3 <- list()
+for(feat in list_features_selected) {
+  i <- which(list_features_selected == feat)
+  figS3[[i]] <- VlnPlot(cHL_Tclust, feat, cols = t_colors) +
+    theme(
+      legend.position = "none",
+      axis.title.x = element_blank()
+    )
+  ggsave(sprintf("Figure_S3_scRNA_TCells_Violin_%s.pdf", feat),
+         figS3[[i]], width = N_W*2, height = N_H)
+  ggsave(sprintf("Figure_S3_scRNA_TCells_Violin_%s.png", feat),
+         figS3[[i]], width = N_W*2, height = N_H)
+  figS3[[i]] <- VlnPlot(cHL_Tclust, feat, pt.size = 0, cols = t_colors)
+  ym <- max(ggplot_build(figS3[[i]])$layout$panel_scales_y[[1]]$range$range)
+  figS3[[i]] <- figS3[[i]] +
+    scale_y_continuous(breaks = c(floor(ym))) + 
+    expand_limits(y = ym) +
+    labs(y = feat) +
+    theme(
+      legend.position = "none",
+      plot.title = element_blank(),
+      axis.text.x = element_blank(), 
+      axis.ticks.x = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(size = rel(1), angle = 0), 
+      axis.text.y = element_text(size = rel(1)), 
+      plot.margin = unit(c(-0.25, 0, -0.25, 0), "in")
+    )
+}
+figS3[[i]] <- figS3[[i]] +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.05),
+    axis.ticks.x = element_line()
+  )
+
+figS3A <- wrap_plots(plotlist = figS3, ncol = 1)
+
+ggsave("Figure_S3_scRNA_TCells_Violin.pdf",
+       figS3A, width = N_W*2, height = N_H*4)
+ggsave("Figure_S3_scRNA_TCells_Violin.png",
+       figS3A, width = N_W*2, height = N_H*4)
+
+```
+
+```{r Figure S5 (Clinical Data Stratification)}
+df_meta <- bind_cols(cHL_Tclust@active.ident, cHL_Tclust@meta.data[["ID"]],
+                     cHL_Tclust@meta.data[["FrequencyStrict"]]) %>%
+  as.data.frame()
+rownames(df_meta) <- rownames(cHL_Tclust@meta.data)
+colnames(df_meta) <- c("cluster_id", "sample_id", "clonotype_size")
+df_meta <- df_meta %>%
+  mutate(group_id = ifelse(grepl("LT", sample_id), "RLT", "cHL"))
+
+tib_eberHLA <- df_meta %>%
+  left_join(
+    tib_samples %>%
+      select(sample_id = ID, EBER, HLA_I = `HLA-ABC+`)
+  ) %>%
+  mutate(
+    EBER = case_when(
+      EBER == TRUE ~ "Positive",
+      EBER == FALSE ~ "Negative",
+      TRUE ~ NA_character_
+    ),
+    HLA_I = case_when(
+      HLA_I %in% c("Reduced", "Present") ~ "Reduced/Present",
+      HLA_I == "Absent" ~ "Absent",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(group_id == "cHL")
+
+
+proportion_by_meta <- function(clustgrepl) {
+  tib_eberHLAggp <- tib_eberHLA %>%
+    group_by(sample_id) %>%
+    mutate(Total = n()) %>%
+    group_by(sample_id, cluster_id, EBER, HLA_I) %>%
+    summarise(Percentage = n()/Total) %>%
+    unique() %>%
+    filter(grepl(clustgrepl, cluster_id)) %>%
+    group_by(sample_id, EBER, HLA_I) %>%
+    summarise(Percentage = sum(Percentage))
+  
+  pEberHLA <- c(
+    EBER = wilcox.test(Percentage ~ EBER, data = tib_eberHLAggp, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value),
+    HLA_I = wilcox.test(Percentage ~ HLA_I, data = tib_eberHLAggp, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value)
+    ) %>%
+    round(3)
+
+  ggp_EBER <- tib_eberHLAggp %>%
+    ggplot(aes(x = EBER, y = Percentage)) +
+      ylab(paste0("% ", clustgrepl, " Cells (p = ", pEberHLA["EBER"], ")")) +
+      xlab("EBER") +
+      geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+      geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+      scale_y_continuous(labels = scales::percent) +
+      theme_bw() +
+      theme(
+        plot.title = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size = 20)
+      )
+  ggp_HLA_I <- tib_eberHLAggp %>%
+    filter(!is.na(HLA_I)) %>%
+    ggplot(aes(x = HLA_I, y = Percentage)) +
+      ylab(paste0("% ", clustgrepl, " Cells (p = ", pEberHLA["HLA_I"], ")")) +
+      xlab("HLA Class I") +
+      geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+      geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+      scale_y_continuous(labels = scales::percent) +
+      theme_bw() +
+      theme(
+        plot.title = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size = 20)
+      )
+  ggsave(paste0("Figure_Supplement_EBER_", clustgrepl, ".pdf"), ggp_EBER, width = N_W, height = N_H)
+  ggsave(paste0("Figure_Supplement_EBER_", clustgrepl, ".png"), ggp_EBER, width = N_W, height = N_H)
+  ggsave(paste0("Figure_Supplement_HLAI_", clustgrepl, ".pdf"), ggp_HLA_I, width = N_W, height = N_H)
+  ggsave(paste0("Figure_Supplement_HLAI_", clustgrepl, ".png"), ggp_HLA_I, width = N_W, height = N_H)
+}
+
+proportion_by_meta("Exhausted CD8")
+proportion_by_meta("Effector CD8")
+
+
+proportion_by_cloneSize <- function(clustgrepl) {
+  tib_eberHLAggp <- tib_eberHLA %>%
+    filter(grepl(clustgrepl, cluster_id)) %>%
+    group_by(sample_id) %>%
+    mutate(Total = n()) %>%
+    filter(clonotype_size > 15) %>%
+    group_by(sample_id, EBER, HLA_I) %>%
+    summarise(Percentage = n()/Total) %>%
+    unique() %>%
+    group_by(sample_id, EBER, HLA_I) %>%
+    summarise(Percentage = sum(Percentage))
+  
+  pEberHLA <- c(
+    EBER = wilcox.test(Percentage ~ EBER, data = tib_eberHLAggp, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value),
+    HLA_I = wilcox.test(Percentage ~ HLA_I, data = tib_eberHLAggp, exact = FALSE) %>%
+      broom::tidy() %>% pull(p.value)
+    ) %>%
+    round(3)
+
+  ggp_EBER <- tib_eberHLAggp %>%
+    ggplot(aes(x = EBER, y = Percentage)) +
+      ylab(paste0("% Expanded (>15) ", clustgrepl, " Cells (p = ", pEberHLA["EBER"], ")")) +
+      xlab("EBER") +
+      geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+      geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+      theme_bw() +
+      theme(
+        plot.title = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size = 20)
+      )
+  ggp_HLA_I <- tib_eberHLAggp %>%
+    filter(!is.na(HLA_I)) %>%
+    ggplot(aes(x = HLA_I, y = Percentage)) +
+      ylab(paste0("% Expanded (>15) ", clustgrepl, " Cells (p = ", pEberHLA["HLA_I"], ")")) +
+      xlab("HLA Class I") +
+      geom_boxplot(alpha = 0.5, outlier.shape = NA) +
+      geom_jitter(position = position_jitter(0.2), size = 5, shape = 1) +
+      theme_bw() +
+      theme(
+        plot.title = element_blank(),
+        panel.grid = element_blank(),
+        text = element_text(size = 20)
+      )
+  ggsave(paste0("Figure_Supplement_EBER_LargeClones_", clustgrepl, ".pdf"), ggp_EBER, width = N_W, height = N_H)
+  ggsave(paste0("Figure_Supplement_EBER_LargeClones_", clustgrepl, ".png"), ggp_EBER, width = N_W, height = N_H)
+  ggsave(paste0("Figure_Supplement_HLAI_LargeClones_", clustgrepl, ".pdf"), ggp_HLA_I, width = N_W, height = N_H)
+  ggsave(paste0("Figure_Supplement_HLAI_LargeClones_", clustgrepl, ".png"), ggp_HLA_I, width = N_W, height = N_H)
+}
+
+proportion_by_cloneSize("Exhausted CD8")
+proportion_by_cloneSize("Effector CD8")
+
+```
+
+```{r Additional Plots}
+figS4A <- tibble(sample = cHL_Tclust$ID, cluster = cHL_Tclust@active.ident, hodgkin = cHL_Tclust$cHL) %>%
+  mutate(hodgkin = if_else(hodgkin, "cHL", "RLT") %>%
+           factor(levels = c("RLT", "cHL"))) %>%
+  group_by(cluster, hodgkin) %>% summarise(clustern = n()) %>%
+  group_by(hodgkin) %>% mutate(clustern = clustern/sum(clustern)) %>%
+  group_by(cluster) %>% mutate(pct = clustern/sum(clustern)) %>%
+  ggplot(aes(x = cluster, pct, fill = hodgkin)) +
+    geom_bar(position = "fill", stat = "identity", color = "black") +
+    scale_y_continuous(labels=scales::percent, expand = c(0,0)) +
+    scale_fill_manual(values = c("cHL" = "#86081C", "RLT" = "#FFB935")) +
+    theme_bw() +
+    theme(
+      panel.border = element_blank(),
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "right"
+    ) +
+    RotatedAxis() + ggft6 + ggft2 + theme(legend.title = element_blank()) +
+    guides(fill = guide_legend(override.aes = list(size = 8))) +
+    theme(axis.text = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.text = element_text(size = 16),
+          plot.caption = element_text(size = 16))
+
+ggsave("Figure_S4A_scRNA_TCells_Cluster_cHLProportions.pdf", figS4A, width = N_W*2, height = N_H)
+ggsave("Figure_S4A_scRNA_TCells_Cluster_cHLProportions.png", figS4A, width = N_W*2, height = N_H)
+
+lvls_id <- c(paste0("HL", 1:14), paste0("LT", 1:5))
+
+id_cols <- (
+  RColorBrewer::brewer.pal(
+    RColorBrewer::brewer.pal.info["Set1","maxcolors"],
+    name = "Set1"
+  ) %>%
+    colorRampPalette()
+)(length(lvls_id))
+names(id_cols) <- lvls_id
+
+figS4B <- tibble(sample = cHL_Tclust$ID, cluster = cHL_Tclust@active.ident, hodgkin = cHL_Tclust$cHL) %>%
+  mutate(hodgkin = if_else(hodgkin, "cHL", "RLT") %>%
+           factor(levels = c("RLT", "cHL"))) %>%
+  filter(hodgkin == "RLT") %>%
+  group_by(cluster, sample) %>% summarise(clustern = n()) %>%
+  group_by(sample) %>% mutate(clustern = clustern/sum(clustern)) %>%
+  group_by(cluster) %>% mutate(pct = clustern/sum(clustern)) %>%
+  ggplot(aes(x = cluster, pct, fill = sample)) +
+    geom_bar(position = "fill", stat = "identity", color = "black") +
+    scale_y_continuous(labels=scales::percent, expand = c(0,0)) +
+#    scale_fill_manual(values = c("cHL" = "#86081C", "RLT" = "#FFB935")) +
+    theme_bw() +
+    theme(
+      panel.border = element_blank(),
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "right"
+    ) +
+    scale_fill_manual(values = id_cols[grepl("LT", names(id_cols))]) +
+    RotatedAxis() + ggft6 + ggft2 + theme(legend.title = element_blank()) +
+    guides(fill = guide_legend(override.aes = list(size = 8))) +
+    theme(axis.text = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.text = element_text(size = 16),
+          plot.caption = element_text(size = 16))
+
+ggsave("Figure_S4B_scRNA_TCells_Cluster_RLTSampleProportions.pdf", figS4B, width = N_W*2, height = N_H)
+ggsave("Figure_S4B_scRNA_TCells_Cluster_RLTSampleProportions.png", figS4B, width = N_W*2, height = N_H)
+
+figS4C <- tibble(sample = cHL_Tclust$ID, cluster = cHL_Tclust@active.ident, hodgkin = cHL_Tclust$cHL) %>%
+  mutate(hodgkin = if_else(hodgkin, "cHL", "RLT") %>%
+           factor(levels = c("RLT", "cHL"))) %>%
+  filter(hodgkin == "cHL") %>%
+  group_by(cluster, sample) %>% summarise(clustern = n()) %>%
+  group_by(sample) %>% mutate(clustern = clustern/sum(clustern)) %>%
+  group_by(cluster) %>% mutate(pct = clustern/sum(clustern)) %>%
+  ggplot(aes(x = cluster, pct, fill = sample)) +
+    geom_bar(position = "fill", stat = "identity", color = "black") +
+    scale_y_continuous(labels=scales::percent, expand = c(0,0)) +
+#    scale_fill_manual(values = c("cHL" = "#86081C", "RLT" = "#FFB935")) +
+    theme_bw() +
+    theme(
+      panel.border = element_blank(),
+      panel.grid = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      legend.position = "right"
+    ) +
+    scale_fill_manual(values = id_cols[grepl("HL", names(id_cols))]) +
+    RotatedAxis() + ggft6 + ggft2 + theme(legend.title = element_blank()) +
+    guides(fill = guide_legend(override.aes = list(size = 8))) +
+    theme(axis.text = element_text(size = 14),
+          legend.title = element_blank(),
+          legend.text = element_text(size = 16),
+          plot.caption = element_text(size = 16))
+
+ggsave("Figure_S4C_scRNA_TCells_Cluster_cHLSampleProportions.pdf", figS4C, width = N_W*2, height = N_H)
+ggsave("Figure_S4C_scRNA_TCells_Cluster_cHLSampleProportions.png", figS4C, width = N_W*2, height = N_H)
+```
+
+```{r Differential Gene Expression (Unused)}
+library(DESeq2)
+library(Matrix.utils)
+library(EnhancedVolcano)
+library(apeglm)
+
+df_meta <- bind_cols(cHL_Tclust@active.ident, cHL_Tclust@meta.data[["ID"]]) %>%
+  as.data.frame()
+rownames(df_meta) <- rownames(cHL_Tclust@meta.data)
+colnames(df_meta) <- c("cluster_id", "sample_id")
+df_meta <- df_meta %>%
+  mutate(group_id = ifelse(grepl("LT", sample_id), "RLT", "cHL"))
+
+aggr_counts <- aggregate.Matrix(t(cHL_Tclust@assays$RNA@counts), groupings = df_meta, fun = "sum") %>%
+  t()
+
+get_dds <- function(filters, comp1, comp2) {
+  column_idx <- rep(TRUE, ncol(aggr_counts))
+  for(filt in filters) {
+    column_idx <- column_idx & grepl(filt, colnames(aggr_counts), fixed = TRUE)
+  }
+  column_idx <- which(column_idx & (
+    grepl(comp1, colnames(aggr_counts), fixed = TRUE) |
+      grepl(comp2, colnames(aggr_counts), fixed = TRUE)
+  ))
+  dds_count <- aggr_counts[, column_idx]
+  dds_meta <- tibble(full_id = colnames(dds_count)) %>%
+    separate(full_id, c("cluster_id", "sample_id", "group_id"),
+             "\\_", FALSE) %>%
+    left_join(df_meta) %>%
+    group_by(full_id, cluster_id, sample_id, group_id) %>%
+    summarise(cell_count = n(), .groups = "drop") %>%
+    mutate(
+      comp_id = case_when(
+        grepl(comp1, full_id) ~ comp1,
+        grepl(comp2, full_id) ~ comp2,
+        TRUE ~ "ERROR"
+      )
+    ) %>%
+    column_to_rownames("full_id")
+  dds <- DESeqDataSetFromMatrix(
+    dds_count,
+    colData = dds_meta,
+    design = ~ comp_id
+  )
+  return(list(count = dds_count, meta = dds_meta, dds = dds))
+}
+
+# Code used from:
+# https://hbctraining.github.io/scRNA-seq_online/lessons/pseudobulk_DESeq2_scrnaseq.html
+
+detable_dds <- function(filters, comp1, comp2, cutoff = 50) {
+  dds <- get_dds(filters, comp1, comp2)
+  rld <- rlog(dds$dds, blind=TRUE)
+
+  dds_de <- DESeq(dds$dds)
+  plotDispEsts(dds_de)
+  
+  resultsNames(dds_de)
+  
+  res <- results(dds_de, 
+                 name = resultsNames(dds_de)[2],
+                 alpha = 0.05)
+  res <- lfcShrink(dds_de, 
+                   coef = resultsNames(dds_de)[2],
+                   res=res,
+                   type = "apeglm")
+  
+  # Turn the DESeq2 results object into a tibble for use with tidyverse functions
+  res_tbl <- res %>%
+    data.frame() %>%
+    rownames_to_column(var = "gene") %>%
+    as_tibble() %>%
+    arrange(padj)
+  
+  return(res_tbl)
+}
+
+
+get_deg <- function(filt, comp1, comp2, topg = 50) {
+  detab <- detable_dds(filt, comp1, comp2)
+  ggpvolc <- EnhancedVolcano(detab, detab$gene, "log2FoldChange", "pvalue",
+                             selectLab = head(detab$gene, topg),
+                             title = paste0(comp1, " vs. ", comp2),
+                             subtitle = "", legendPosition = "none")
+  figname <- sprintf("Supplement_DEGenes_%s_%s", comp1, comp2)
+  writexl::write_xlsx(detab, paste0("Table_", figname, ".xlsx"))
+  ggsave(paste0("Figure_", figname, ".pdf"), ggpvolc, width = N_W, height = N_H)
+  ggsave(paste0("Figure_", figname, ".png"), ggpvolc, width = N_W, height = N_H)
+}
+
+get_deg(c(), "Treg", "Exhausted CD4 T")
+get_deg(c(), "Treg", "Memory CD4 T")
+get_deg(c(), "Memory CD4 T", "Exhausted CD4 T")
+
+get_deg(c(), "Effector CD8 T", "Exhausted CD8 T")
+
+```
